@@ -9,6 +9,10 @@ The deployed entrypoint imports ``build_improved_warehouse_agent`` from ``util.w
 (the Dockerfile copies ``util/`` into the container), so the agent graded in production is the
 exact same eval-driven architecture Stage 1 grades locally — the ``get_warehouse_stock`` deep tool
 plus the selector/``odata_caller`` fallback — true parity, no duplicated code.
+
+The agent is deployed as an A2A-protocol runtime (``protocol="A2A"``) secured with a Cognito
+JWT authorizer reused from Lab 7. Invocations use JSON-RPC 2.0 over HTTPS rather than
+``invoke_agent_runtime``.
 """
 
 from __future__ import annotations
@@ -16,50 +20,45 @@ from __future__ import annotations
 import json
 import os
 
-# Entrypoint written into the build context and run inside the AgentCore container. It stays
-# tiny on purpose: the agent, prompts, and tools all come from util/, which the Dockerfile copies in.
+# Entrypoint written into the build context and run inside the AgentCore container.
+# Uses StrandsA2AExecutor + serve_a2a with an agent_factory so each A2A context_id
+# (per-conversation session) gets its own agent instance — required for concurrent safety.
 ENTRYPOINT_SOURCE = '''\
-# Lab 09 Stage 2 entrypoint: the improved warehouse agent, redeployed to verify the fix in prod.
-from bedrock_agentcore.runtime import BedrockAgentCoreApp
-from bedrock_agentcore.runtime.context import RequestContext
+# Lab 09 Stage 2 entrypoint: the improved warehouse agent deployed as an A2A runtime.
+from strands.multiagent.a2a.executor import StrandsA2AExecutor
+from bedrock_agentcore.runtime import serve_a2a
 
-from util.strands_bedrock_sap_genai_hub import SAPGenAIHubModel
+from strands.models.litellm import LiteLLMModel
 from util.warehouse_agent import build_improved_warehouse_agent
 
-app = BedrockAgentCoreApp()
-model = SAPGenAIHubModel(model_id="{model_id}")
+# The sap/ prefix routes through SAP GenAI Hub via LiteLLM.
+model = LiteLLMModel(model_id="sap/{model_id}")
 
 
-@app.entrypoint
-def warehouse_agent_entrypoint(payload, context: RequestContext):
-    """Invoke the improved warehouse agent (deep tool + dynamic-discovery fallback)."""
-    user_input = payload.get("prompt")
-    print("User input:", user_input)
-    agent = build_improved_warehouse_agent(model)
-    return agent(user_input).message
+def warehouse_agent_factory(context_id: str):
+    """Build a fresh improved warehouse agent per A2A context (conversation session)."""
+    return build_improved_warehouse_agent(model)
 
 
 if __name__ == "__main__":
-    app.run()
+    serve_a2a(StrandsA2AExecutor(agent_factory=warehouse_agent_factory))
 '''
 
-# Container dependencies. Versions are pinned to mirror pyproject.toml, NOT loosened, so the
-# deployed runtime resolves the same stack the notebook was validated against. In particular
-# sap-ai-sdk-gen is pinned >=6.10.0: the 5.x line caps botocore below the floor that a modern
-# bedrock-agentcore needs (see the pyproject.toml comment), so an unbounded >=5.5.0 here would
-# let the container resolve the exact combination pyproject was written to avoid. The starter
-# toolkit auto-adds aws-opentelemetry-distro and the opentelemetry-instrument entrypoint when
-# observability is enabled (the default), so OTEL spans — which Stage 2 grades — need no line here.
+# Container dependencies — A2A extras added for StrandsA2AExecutor and serve_a2a.
+# Versions are pinned to mirror pyproject.toml, NOT loosened, so the deployed runtime
+# resolves the same stack the notebook was validated against.
 REQUIREMENTS = """\
-# AgentCore requirements (pins mirror pyproject.toml)
-strands-agents==1.14.0
+# AgentCore requirements (pins mirror pyproject.toml) — A2A protocol build
+strands-agents[a2a]==1.14.0
+strands-agents[litellm]==1.14.0
 strands-agents-tools==0.2.0
 uv
 boto3>=1.37.0
-bedrock-agentcore>=1.6.0
+bedrock-agentcore[a2a]>=1.11.0
 bedrock-agentcore-starter-toolkit==0.1.14
-# SAP GenAI Hub and warehouse agent dependencies
-sap-ai-sdk-gen[all]>=6.10.0
+uvicorn
+# SAP GenAI Hub via LiteLLM (no sap-ai-sdk-gen needed for LiteLLMModel)
+litellm>=1.0.0
 pyyaml
 requests
 python-dotenv
@@ -69,17 +68,11 @@ python-dotenv
 # package, the OpenAPI knowledgebase, and the SAP GenAI Hub credentials.
 _DOCKERFILE_ADDITIONS = [
     "",
-    "# Copy util directory (required for SAP GenAI Hub model and OData tool)",
+    "# Copy util directory (required for warehouse agent and OData tool)",
     "COPY util/ ./util/",
     "",
     "# Copy assets directory (required for OpenAPI knowledgebase)",
     "COPY assets/ ./assets/",
-    "",
-    "# Copy the config.json from your local machine",
-    "COPY config.json /app/.aicore/config.json",
-    "",
-    "# Set AICORE_HOME environment variable for SAP GenAI Hub SDK",
-    "ENV AICORE_HOME=/app/.aicore",
     "",
 ]
 
@@ -87,24 +80,15 @@ END_STATUSES = ["READY", "CREATE_FAILED", "DELETE_FAILED", "UPDATE_FAILED"]
 
 
 def _write_build_context(entrypoint_file, model_id):
-    """Write the entrypoint, requirements.txt, and config.json into the build context."""
+    """Write the entrypoint and requirements.txt into the build context."""
     with open(entrypoint_file, "w") as f:
         f.write(ENTRYPOINT_SOURCE.format(model_id=model_id))
 
     with open("requirements.txt", "w") as f:
         f.write(REQUIREMENTS)
 
-    # Materialize ~/.aicore/config.json into the build context so the Dockerfile can COPY it.
-    # This file is gitignored and transient, so it may be absent when Lab 09 runs on its own.
-    config_path = os.path.expanduser("~/.aicore/config.json")
-    if not os.path.exists(config_path):
-        raise SystemExit(
-            f"{config_path} not found. Run notebook 00 to configure SAP AI Core credentials first."
-        )
-    with open(config_path, "r") as src:
-        aicore_config = json.load(src)
-    with open("config.json", "w") as f:
-        json.dump(aicore_config, f, indent=2)
+    # LiteLLMModel reads SAP credentials from environment variables set at launch() time;
+    # no config.json / AICORE_HOME needed in the container.
 
 
 def _patch_dockerfile(dockerfile="Dockerfile"):
@@ -113,7 +97,7 @@ def _patch_dockerfile(dockerfile="Dockerfile"):
         content = f.read()
 
     if "AICORE_HOME" in content:
-        return "Dockerfile already contains SAP GenAI Hub configuration, skipping."
+        return "Dockerfile already contains AICORE_HOME (skipping -- not needed for LiteLLM)."
 
     lines = content.split("\n")
     cmd_index = next((i for i, line in enumerate(lines) if line.strip().startswith("CMD")), -1)
@@ -130,36 +114,48 @@ def deploy_improved_agent(
     agent_name,
     region,
     sap_api_key,
+    discovery_url,
+    client_id,
     entrypoint_file="warehouse_agent_agentcore.py",
     model_id="anthropic--claude-4.5-sonnet",
     poll_seconds=10,
 ):
-    """Redeploy the improved warehouse agent in-place to the Lab 7 AgentCore Runtime.
+    """Deploy the improved warehouse agent as a new A2A-protocol AgentCore Runtime.
 
-    Reuses ``agent_name`` with ``auto_update_on_conflict=True`` so the existing AGENT_ID /
-    AGENT_ARN stay valid. Blocks until the runtime reaches READY and raises ``SystemExit`` on
-    any failure status, so the caller never grades a half-deployed (still-baseline) runtime.
+    Creates a fresh runtime named ``agent_name`` secured with a Cognito JWT authorizer
+    (``discovery_url`` / ``client_id`` reused from Lab 7). The runtime serves the
+    ``StrandsA2AExecutor``-based entrypoint and is invocable via JSON-RPC 2.0 over HTTPS.
+    Blocks until the runtime reaches READY, raising ``SystemExit`` on any failure status.
 
     Args:
-        agent_name: The Lab 7 runtime name to update in place.
-        region: AWS region of the runtime.
-        sap_api_key: SAP S/4HANA key passed to the container so its OData calls authenticate.
-        entrypoint_file: Path for the generated entrypoint (matches the Lab 7 filename).
-        model_id: SAP GenAI Hub model the deployed agent uses.
+        agent_name: Name for the new AgentCore Runtime.
+        region: AWS region to deploy into.
+        sap_api_key: SAP S/4HANA key injected into the container for OData authentication.
+        discovery_url: Cognito OIDC discovery URL (from Lab 7 Cognito setup).
+        client_id: Cognito app client ID (from Lab 7 Cognito setup).
+        entrypoint_file: Path for the generated entrypoint file.
+        model_id: Model identifier (without sap/ prefix) passed to LiteLLMModel.
+            The entrypoint prepends "sap/" so LiteLLM routes via SAP GenAI Hub.
         poll_seconds: Seconds between runtime status polls.
 
     Returns:
         The final runtime status string ("READY").
     """
     import time
-
+    from pathlib import Path
     from bedrock_agentcore_starter_toolkit import Runtime
 
     _write_build_context(entrypoint_file, model_id)
-    print("Wrote entrypoint, requirements.txt, and config.json into the build context.")
+    print("Wrote entrypoint and requirements.txt into the build context.")
+
+    # Clear any stale cached agent state so configure() creates a fresh runtime.
+    stale_config = Path.home() / ".bedrock_agentcore.yaml"
+    if stale_config.exists():
+        stale_config.unlink()
+        print("Cleared stale agent config: ~/.bedrock_agentcore.yaml")
 
     runtime = Runtime()
-    print(f"Updating existing AgentCore Runtime: {agent_name}")
+    print(f"Deploying new A2A AgentCore Runtime: {agent_name}")
     runtime.configure(
         entrypoint=entrypoint_file,
         auto_create_execution_role=True,
@@ -167,14 +163,25 @@ def deploy_improved_agent(
         requirements_file="requirements.txt",
         region=region,
         agent_name=agent_name,
+        protocol="A2A",
+        authorizer_configuration={
+            "customJWTAuthorizer": {
+                "discoveryUrl": discovery_url,
+                "allowedClients": [client_id],
+                # allowedAudience is intentionally omitted —
+                # Cognito client_credentials tokens have no 'aud' claim
+            }
+        },
+        non_interactive=True,
     )
     print(_patch_dockerfile())
 
-    runtime.launch(
-        auto_update_on_conflict=True,
+    launch_result = runtime.launch(
         env_vars={"SAP_S4HANA_PUBLIC_CLOUD_KEY": sap_api_key},
     )
-    print("Deployment of the improved agent initiated on the existing runtime.")
+    print(f"A2A deployment initiated.")
+    print(f"  Agent ID : {launch_result.agent_id}")
+    print(f"  Agent ARN: {launch_result.agent_arn}")
 
     status = runtime.status().endpoint["status"]
     print(f"Initial status: {status}")
@@ -186,7 +193,6 @@ def deploy_improved_agent(
     print(f"\nFinal status: {status}")
     if status != "READY":
         raise SystemExit(
-            f"Redeploy did not reach READY (final status: {status}). Stage 2 aborted, "
-            "refusing to grade a half-deployed runtime."
+            f"Deploy did not reach READY (final status: {status}). Stage 2 aborted."
         )
-    return status
+    return launch_result

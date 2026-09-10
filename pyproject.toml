@@ -5,17 +5,16 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12.9"
 dependencies = [
-    "boto3>=1.37.0",
-    "ddgs>=8.0.4",
-    "sap-ai-sdk-gen[all]>=6.10.0",
-    "ipykernel>=6.29.5",
-    "strands-agents==1.14.0",
-    "strands-agents-builder==0.1.8",
+    "boto3==1.43.74",
+    "ddgs==9.15.0",
+    "sap-ai-sdk-gen==7.2.0",
+    "ipykernel==7.3.0",
+    "strands-agents[litellm]==1.52.0",
     "strands-agents-tools==0.2.0",
-    "streamlit>=1.46.1",
-    "uvicorn>=0.34.3",
-    "tavily-python",
-    "bedrock-agentcore>=1.6.0",
+    "strands-agents-builder==0.1.10",
+    "uvicorn==0.52.3",
+    "tavily-python==0.7.27",
+    "bedrock-agentcore==1.6.0",
     "bedrock-agentcore-starter-toolkit==0.1.28",
     "strands-agents-evals==0.2.0",
 ]
