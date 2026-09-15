@@ -7,7 +7,7 @@ requires-python = ">=3.12.9"
 dependencies = [
     "boto3==1.43.74",
     "ddgs==9.15.0",
-    "sap-ai-sdk-gen==7.2.0",
+    "sap-ai-sdk-gen[all]==7.2.0",
     "ipykernel==7.3.0",
     "strands-agents[litellm]==1.52.0",
     "strands-agents-tools==0.2.0",

@@ -223,9 +223,11 @@ def odata_caller(
                 username, password = auth_token.split(":", 1)
                 auth = requests.auth.HTTPBasicAuth(username, password)
         elif auth_type_lower == "api_key":
-            # For SAP APIs, use APIKey header instead of X-API-Key
+            # SAP API Hub / Business Accelerator Hub sandbox uses the lowercase header name
+            # "apikey" — the Apigee policy resolves it via request.header.apikey (case-sensitive).
+            # Sending "APIKey" (mixed case) triggers FailedToResolveAPIKey on the gateway.
             if "sandbox.api.sap.com" in full_url or "api.sap.com" in full_url:
-                request_headers["APIKey"] = auth_token
+                request_headers["apikey"] = auth_token
             else:
                 request_headers["X-API-Key"] = auth_token
         elif auth_type_lower == "jwt":
