@@ -21,8 +21,10 @@ import json
 import os
 
 # Entrypoint written into the build context and run inside the AgentCore container.
-# Uses StrandsA2AExecutor + serve_a2a with an agent_factory so each A2A context_id
-# (per-conversation session) gets its own agent instance — required for concurrent safety.
+# StrandsA2AExecutor in strands-agents>=1.52.0 accepts a single `agent` argument
+# (the agent_factory pattern was available in earlier versions only).
+# The agent is built once at module load; concurrent A2A requests are handled by
+# the serve_a2a / uvicorn layer, each invocation runs in its own async context.
 ENTRYPOINT_SOURCE = '''\
 # Lab 09 Stage 2 entrypoint: the improved warehouse agent deployed as an A2A runtime.
 from strands.multiagent.a2a.executor import StrandsA2AExecutor
@@ -34,14 +36,12 @@ from util.warehouse_agent import build_improved_warehouse_agent
 # The sap/ prefix routes through SAP GenAI Hub via LiteLLM.
 model = LiteLLMModel(model_id="sap/{model_id}")
 
-
-def warehouse_agent_factory(context_id: str):
-    """Build a fresh improved warehouse agent per A2A context (conversation session)."""
-    return build_improved_warehouse_agent(model)
-
+# Build the agent once at startup (strands-agents>=1.52 StrandsA2AExecutor takes
+# a single agent instance, not agent_factory).
+agent = build_improved_warehouse_agent(model)
 
 if __name__ == "__main__":
-    serve_a2a(StrandsA2AExecutor(agent_factory=warehouse_agent_factory))
+    serve_a2a(StrandsA2AExecutor(agent=agent))
 '''
 
 # Container dependencies — A2A extras added for StrandsA2AExecutor and serve_a2a.
@@ -49,8 +49,8 @@ if __name__ == "__main__":
 # resolves the same stack the notebook was validated against.
 REQUIREMENTS = """\
 # AgentCore requirements (pins mirror pyproject.toml) — A2A protocol build
-strands-agents[a2a]==1.14.0
-strands-agents[litellm]==1.14.0
+strands-agents[a2a]==1.52.0
+strands-agents[litellm]==1.52.0
 strands-agents-tools==0.2.0
 uv
 boto3>=1.37.0
