@@ -34,7 +34,12 @@ from strands.models.litellm import LiteLLMModel
 from util.warehouse_agent import build_improved_warehouse_agent
 
 # The sap/ prefix routes through SAP GenAI Hub via LiteLLM.
-model = LiteLLMModel(model_id="sap/{model_id}")
+# stream=False is required — SAP GenAI Hub's /v2/completion endpoint returns 400 for
+# streaming requests on Claude models; the non-streaming path uses the correct route.
+model = LiteLLMModel(
+    model_id="sap/{model_id}",
+    params={{"max_tokens": 4096, "stream": False}},
+)
 
 # Build the agent once at startup (strands-agents>=1.52 StrandsA2AExecutor takes
 # a single agent instance, not agent_factory).
@@ -182,6 +187,32 @@ def deploy_improved_agent(
     print(f"A2A deployment initiated.")
     print(f"  Agent ID : {launch_result.agent_id}")
     print(f"  Agent ARN: {launch_result.agent_arn}")
+
+    # Explicitly enable observability for this runtime. The toolkit calls
+    # enable_traces_delivery_for_runtime() inside launch() automatically, but it
+    # catches all exceptions and continues silently — so if it failed (e.g. a
+    # transient permission issue) the agent shows "Tracing - Not enabled" in the
+    # console and the AgentCore evaluators find no spans. Calling it here ensures
+    # the CloudWatch delivery source/destination and Transaction Search are
+    # configured, and prints a clear message if something goes wrong.
+    try:
+        import boto3 as _boto3
+        from bedrock_agentcore_starter_toolkit.services.xray import (
+            enable_traces_delivery_for_runtime,
+            enable_transaction_search_if_needed,
+        )
+        _account_id = _boto3.client("sts", region_name=region).get_caller_identity()["Account"]
+        print("Configuring observability (Transaction Search + traces delivery)...")
+        enable_transaction_search_if_needed(region, _account_id)
+        enable_traces_delivery_for_runtime(
+            agent_id=launch_result.agent_id,
+            agent_arn=launch_result.agent_arn,
+            region=region,
+        )
+        print("  Observability configured.")
+    except Exception as _obs_err:
+        print(f"  WARNING: observability setup failed: {_obs_err}")
+        print("  Stage 2 grading may return empty scores — verify tracing in the AgentCore console.")
 
     status = runtime.status().endpoint["status"]
     print(f"Initial status: {status}")
