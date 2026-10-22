@@ -21,10 +21,10 @@ import json
 import os
 
 # Entrypoint written into the build context and run inside the AgentCore container.
-# StrandsA2AExecutor in strands-agents>=1.52.0 accepts a single `agent` argument
-# (the agent_factory pattern was available in earlier versions only).
-# The agent is built once at module load; concurrent A2A requests are handled by
-# the serve_a2a / uvicorn layer, each invocation runs in its own async context.
+# Uses LiteLLMModel with the sap/ prefix to route through SAP GenAI Hub.
+# SAP AI Core credentials are injected as AICORE_* env vars at launch() time
+# (config.json is gitignored, so env vars are the reliable delivery mechanism).
+# StrandsA2AExecutor in strands-agents>=1.52.0 accepts a single `agent` argument.
 ENTRYPOINT_SOURCE = '''\
 # Lab 09 Stage 2 entrypoint: the improved warehouse agent deployed as an A2A runtime.
 from strands.multiagent.a2a.executor import StrandsA2AExecutor
@@ -33,9 +33,9 @@ from bedrock_agentcore.runtime import serve_a2a
 from strands.models.litellm import LiteLLMModel
 from util.warehouse_agent import build_improved_warehouse_agent
 
-# The sap/ prefix routes through SAP GenAI Hub via LiteLLM.
-# stream=False is required — SAP GenAI Hub's /v2/completion endpoint returns 400 for
-# streaming requests on Claude models; the non-streaming path uses the correct route.
+# sap/ prefix routes through SAP GenAI Hub via LiteLLM.
+# Credentials come from AICORE_* env vars injected at launch() time.
+# stream=False: SAP GenAI Hub returns 400 for streaming on Claude models.
 model = LiteLLMModel(
     model_id="sap/{model_id}",
     params={{"max_tokens": 4096, "stream": False}},
@@ -62,7 +62,8 @@ boto3>=1.37.0
 bedrock-agentcore[a2a]>=1.11.0
 bedrock-agentcore-starter-toolkit==0.1.14
 uvicorn
-# SAP GenAI Hub via LiteLLM (no sap-ai-sdk-gen needed for LiteLLMModel)
+# SAP GenAI Hub and warehouse agent dependencies
+sap-ai-sdk-gen[all]>=6.10.0
 litellm>=1.0.0
 pyyaml
 requests
@@ -70,10 +71,12 @@ python-dotenv
 """
 
 # Lines inserted into the generated Dockerfile (before CMD) so the container has the util
-# package, the OpenAPI knowledgebase, and the SAP GenAI Hub credentials.
+# package and the OpenAPI knowledgebase.
+# SAP AI Core credentials are injected as AICORE_* env vars at launch() time — config.json
+# is gitignored and excluded from the CodeBuild zip, so COPY config.json would fail.
 _DOCKERFILE_ADDITIONS = [
     "",
-    "# Copy util directory (required for warehouse agent and OData tool)",
+    "# Copy util directory (required for SAP GenAI Hub model and OData tool)",
     "COPY util/ ./util/",
     "",
     "# Copy assets directory (required for OpenAPI knowledgebase)",
@@ -85,24 +88,26 @@ END_STATUSES = ["READY", "CREATE_FAILED", "DELETE_FAILED", "UPDATE_FAILED"]
 
 
 def _write_build_context(entrypoint_file, model_id):
-    """Write the entrypoint and requirements.txt into the build context."""
+    """Write the entrypoint, requirements.txt, and config.json into the build context."""
     with open(entrypoint_file, "w") as f:
         f.write(ENTRYPOINT_SOURCE.format(model_id=model_id))
 
     with open("requirements.txt", "w") as f:
         f.write(REQUIREMENTS)
 
-    # LiteLLMModel reads SAP credentials from environment variables set at launch() time;
-    # no config.json / AICORE_HOME needed in the container.
+    # Note: config.json is NOT written to the build context here because it is listed
+    # in .gitignore and the toolkit's zip filter excludes gitignored files from the
+    # CodeBuild source upload. SAP AI Core credentials are injected as AICORE_* env
+    # vars at launch() time instead — LiteLLM checks them before the config file.
 
 
 def _patch_dockerfile(dockerfile="Dockerfile"):
-    """Insert the util/, assets/, and SAP GenAI Hub credential lines before CMD (idempotent)."""
+    """Insert the util/ and assets/ lines before CMD (idempotent)."""
     with open(dockerfile, "r") as f:
         content = f.read()
 
-    if "AICORE_HOME" in content:
-        return "Dockerfile already contains AICORE_HOME (skipping -- not needed for LiteLLM)."
+    if "COPY util/ ./util/" in content:
+        return "Dockerfile already contains util/ configuration, skipping."
 
     lines = content.split("\n")
     cmd_index = next((i for i, line in enumerate(lines) if line.strip().startswith("CMD")), -1)
@@ -112,7 +117,36 @@ def _patch_dockerfile(dockerfile="Dockerfile"):
     modified = lines[:cmd_index] + _DOCKERFILE_ADDITIONS + lines[cmd_index:]
     with open(dockerfile, "w") as f:
         f.write("\n".join(modified))
-    return "Dockerfile modified with util/, assets/, and SAP GenAI Hub configuration."
+    return "Dockerfile modified with util/ and assets/."
+
+
+def _load_aicore_env_vars() -> dict:
+    """Read SAP AI Core credentials from ~/.aicore/config.json and return as AICORE_* env vars.
+
+    LiteLLM's sap/ provider checks individual AICORE_* env vars (source 3) before
+    the config file (source 4), so injecting them at launch() time works even though
+    config.json is gitignored and excluded from the CodeBuild zip.
+    """
+    config_path = os.path.expanduser("~/.aicore/config.json")
+    if not os.path.exists(config_path):
+        raise SystemExit(
+            f"{config_path} not found. Run notebook 00 to configure SAP AI Core credentials first."
+        )
+    with open(config_path, "r") as f:
+        cfg = json.load(f)
+
+    mapping = {
+        "AICORE_CLIENT_ID":      cfg.get("AICORE_CLIENT_ID"),
+        "AICORE_CLIENT_SECRET":  cfg.get("AICORE_CLIENT_SECRET"),
+        "AICORE_AUTH_URL":       cfg.get("AICORE_AUTH_URL"),
+        "AICORE_BASE_URL":       cfg.get("AICORE_BASE_URL"),
+        "AICORE_RESOURCE_GROUP": cfg.get("AICORE_RESOURCE_GROUP", "default"),
+    }
+    missing = [k for k, v in mapping.items() if not v]
+    if missing:
+        raise SystemExit(f"SAP AI Core config is missing keys: {missing}. Check ~/.aicore/config.json.")
+    print(f"  Loaded {len(mapping)} SAP AI Core credential keys from {config_path}")
+    return mapping
 
 
 def deploy_improved_agent(
@@ -144,7 +178,7 @@ def deploy_improved_agent(
         poll_seconds: Seconds between runtime status polls.
 
     Returns:
-        The final runtime status string ("READY").
+        The launch_result object (agent_id, agent_arn).
     """
     import time
     from pathlib import Path
@@ -152,6 +186,7 @@ def deploy_improved_agent(
 
     _write_build_context(entrypoint_file, model_id)
     print("Wrote entrypoint and requirements.txt into the build context.")
+    aicore_env = _load_aicore_env_vars()
 
     # Clear any stale cached agent state so configure() creates a fresh runtime.
     stale_config = Path.home() / ".bedrock_agentcore.yaml"
@@ -182,7 +217,10 @@ def deploy_improved_agent(
     print(_patch_dockerfile())
 
     launch_result = runtime.launch(
-        env_vars={"SAP_S4HANA_PUBLIC_CLOUD_KEY": sap_api_key},
+        env_vars={
+            "SAP_S4HANA_PUBLIC_CLOUD_KEY": sap_api_key,
+            **aicore_env,  # AICORE_CLIENT_ID, AICORE_CLIENT_SECRET, AICORE_AUTH_URL, AICORE_BASE_URL, AICORE_RESOURCE_GROUP
+        },
     )
     print(f"A2A deployment initiated.")
     print(f"  Agent ID : {launch_result.agent_id}")
@@ -192,9 +230,7 @@ def deploy_improved_agent(
     # enable_traces_delivery_for_runtime() inside launch() automatically, but it
     # catches all exceptions and continues silently — so if it failed (e.g. a
     # transient permission issue) the agent shows "Tracing - Not enabled" in the
-    # console and the AgentCore evaluators find no spans. Calling it here ensures
-    # the CloudWatch delivery source/destination and Transaction Search are
-    # configured, and prints a clear message if something goes wrong.
+    # console and the AgentCore evaluators find no spans.
     try:
         import boto3 as _boto3
         from bedrock_agentcore_starter_toolkit.services.xray import (
